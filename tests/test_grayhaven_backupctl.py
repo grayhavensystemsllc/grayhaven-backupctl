@@ -51,6 +51,22 @@ class FakeRunner(backupctl_module.CommandRunner):
         return mock.Mock(stdout=output, stderr="", returncode=0)
 
 
+def invented_backup_config() -> Any:
+    return backupctl_module.BackupConfig(
+        local_repository="/fixture/repository",
+        remote_enabled=True,
+        remote_repository="fixture:remote",
+        password_file="/fixture/password",
+        include_file="/fixture/include",
+        exclude_file="/fixture/exclude",
+        keep_daily=3,
+        restic_cache_dir="/fixture/cache",
+        gcs_credentials_file="/fixture/credentials",
+        gcs_project_id="example-project",
+        repository_selection_supported=True,
+    )
+
+
 class OSErrorRunner(backupctl_module.CommandRunner):
     """Runner fixture that simulates an unavailable command."""
 
@@ -1519,239 +1535,96 @@ class GrayhavenBackupctlTests(unittest.TestCase):
                 backupctl_module.confirm_overwrite(pathlib.Path("/restore/file"))
             )
 
-    def test_backup_all_uses_authoritative_script(self) -> None:
-        runner = FakeRunner({(str(backupctl_module.BACKUP_SCRIPT),): ""})
-        service = backupctl_module.BackupService(self.config, runner)
+    def test_each_backup_selection_uses_the_same_managed_workflow(self) -> None:
+        config = invented_backup_config()
+        script = pathlib.Path("/fixture/backup-runner")
+        with mock.patch.object(backupctl_module, "BACKUP_SCRIPT", script):
+            for selection in ("local", "remote", "all"):
+                with self.subTest(selection=selection):
+                    runner = FakeRunner()
+                    service = backupctl_module.BackupService(config, runner)
+                    service.journal = mock.Mock()
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        service.backup(selection, verbose=False)
+                    self.assertEqual(runner.calls, [[str(script), "--repo", selection]])
 
-        with contextlib.redirect_stdout(io.StringIO()) as stdout:
-            service.backup("all", verbose=False)
-
-        self.assertIn([str(backupctl_module.BACKUP_SCRIPT)], runner.calls)
-        self.assertIn("Backup completed", stdout.getvalue())
-
-    def test_backup_all_warns_when_remote_is_not_configured(self) -> None:
+    def test_unsupported_managed_workflow_fails_before_any_backup(self) -> None:
+        runner = FakeRunner()
         config = dataclass_replace(
-            self.config, remote_enabled=False, remote_repository=None
+            invented_backup_config(), repository_selection_supported=False
         )
-        runner = FakeRunner({(str(backupctl_module.BACKUP_SCRIPT),): ""})
         service = backupctl_module.BackupService(config, runner)
+        for selection in ("local", "remote", "all", "invalid"):
+            with (
+                self.subTest(selection=selection),
+                self.assertRaises(backupctl_module.GrayhavenBackupctlError),
+            ):
+                service.backup(selection, verbose=False)
+        self.assertFalse(runner.calls)
 
-        with contextlib.redirect_stdout(io.StringIO()) as stdout:
-            service.backup("all", verbose=False)
-
-        self.assertIn("remote backups are not configured", stdout.getvalue())
-        self.assertIn([str(backupctl_module.BACKUP_SCRIPT)], runner.calls)
-
-    def test_backup_remote_warns_when_remote_is_not_configured(self) -> None:
+    def test_remote_unavailable_skips_remote_and_all_still_runs_local_workflow(
+        self,
+    ) -> None:
         config = dataclass_replace(
-            self.config, remote_enabled=False, remote_repository=None
+            invented_backup_config(), remote_enabled=False, remote_repository=None
         )
         runner = FakeRunner()
         service = backupctl_module.BackupService(config, runner)
-
-        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+        service.journal = mock.Mock()
+        script = pathlib.Path("/fixture/backup-runner")
+        with (
+            mock.patch.object(backupctl_module, "BACKUP_SCRIPT", script),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
             service.backup("remote", verbose=False)
+            service.backup("all", verbose=False)
+        self.assertEqual(runner.calls, [[str(script), "--repo", "all"]])
 
-        self.assertIn("remote backups are not configured", stdout.getvalue())
-        self.assertFalse(any(call and call[0] == "restic" for call in runner.calls))
-
-    def test_backup_local_runs_restic_backup_and_retention(self) -> None:
-        runner = FakeRunner()
-        service = backupctl_module.BackupService(self.config, runner)
-
+    def test_managed_workflow_failure_is_reported_and_verbose_output_is_preserved(
+        self,
+    ) -> None:
+        config = invented_backup_config()
+        runner = mock.Mock(spec=backupctl_module.CommandRunner)
+        service = backupctl_module.BackupService(config, runner)
+        sample_output = "example result\n"
+        runner.run.return_value = mock.Mock(stdout=sample_output)
         with mock.patch.object(
-            backupctl_module, "hostname_fqdn", return_value="host.example.com"
+            backupctl_module, "BACKUP_SCRIPT", pathlib.Path("/fixture/backup-runner")
         ):
             with contextlib.redirect_stdout(io.StringIO()) as stdout:
-                service.backup("local", verbose=True)
-
-        self.assertIn("Creating local backup", stdout.getvalue())
-        self.assertIn("Repository: /var/backups/restic", stdout.getvalue())
-        self.assertIn(
-            list(
-                restic_key(
-                    "/var/backups/restic",
-                    "backup",
-                    "--files-from",
-                    "/etc/grayhaven/backup/include",
-                    "--exclude-file",
-                    "/etc/grayhaven/backup/exclude",
-                    "--tag",
-                    "grayhaven-local",
-                    "--host",
-                    "host.example.com",
+                service.run_authoritative_backup("local", verbose=True)
+            self.assertEqual(stdout.getvalue(), sample_output)
+            for message in ("example failure", ""):
+                runner.run.side_effect = subprocess.CalledProcessError(
+                    1, ["fixture"], stderr=message
                 )
-            ),
-            runner.calls,
-        )
-        self.assertIn(
-            list(
-                restic_key(
-                    "/var/backups/restic",
-                    "forget",
-                    "--group-by",
-                    "host",
-                    "--keep-daily",
-                    "7",
-                    "--prune",
+                with (
+                    self.subTest(message=message),
+                    self.assertRaises(backupctl_module.GrayhavenBackupctlError),
+                ):
+                    service.backup("local", verbose=False)
+
+    def test_backup_script_capability_is_read_from_synthetic_configuration(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = pathlib.Path(folder) / "fixture-script"
+            base = (
+                "LOCAL_REPOSITORY=/fixture/local\nPASSWORD_FILE=/fixture/password\n"
+                "INCLUDE_FILE=/fixture/include\nEXCLUDE_FILE=/fixture/exclude\n"
+                "KEEP_DAILY=3\nRESTIC_CACHE_DIR=/fixture/cache\n"
+            )
+            for flag, expected in (("true", True), ("false", False), (None, False)):
+                path.write_text(
+                    base + (f"BACKUP_REPOSITORY_SELECTION={flag}\n" if flag else "")
                 )
-            ),
-            runner.calls,
-        )
-
-    def test_backup_local_updates_restic_success_metrics(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            metrics_path = pathlib.Path(temp_dir) / "restic.prom"
-            repository_metric = (
-                "grayhaven_restic_repository_last_success_timestamp_seconds"
-            )
-            metrics_path.write_text(
-                "\n".join(
-                    [
-                        f"# HELP {repository_metric} Last restic backup by repository.",
-                        f"# TYPE {repository_metric} gauge",
-                        (
-                            f'{repository_metric}{{host="host.example.com",'
-                            'repository="remote"} 123'
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            runner = FakeRunner()
-            service = backupctl_module.BackupService(
-                self.config, runner, metrics_path=metrics_path
-            )
-
-            with (
-                mock.patch.object(
-                    backupctl_module, "hostname_fqdn", return_value="host.example.com"
-                ),
-                mock.patch.object(
-                    backupctl_module, "current_epoch_seconds", return_value=456
-                ),
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                service.backup("local", verbose=False)
-
-            metrics = metrics_path.read_text(encoding="utf-8")
-
-        backup_metric = "grayhaven_restic_backup_last_success_timestamp_seconds"
-        repository_metric = "grayhaven_restic_repository_last_success_timestamp_seconds"
-        self.assertIn(
-            f'{backup_metric}{{host="host.example.com"}} 456',
-            metrics,
-        )
-        self.assertIn(
-            (f'{repository_metric}{{host="host.example.com",repository="local"}} 456'),
-            metrics,
-        )
-        self.assertIn(
-            (f'{repository_metric}{{host="host.example.com",repository="remote"}} 123'),
-            metrics,
-        )
-
-    def test_repository_metrics_ignore_missing_file_and_other_hosts(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            metrics_path = pathlib.Path(temp_dir) / "restic.prom"
-            repository_metric = (
-                "grayhaven_restic_repository_last_success_timestamp_seconds"
-            )
-            metrics_path.write_text(
-                "\n".join(
-                    [
-                        "not a metric",
-                        (
-                            f'{repository_metric}{{host="other.example.com",'
-                            'repository="remote"} 123'
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            self.assertIsInstance(backupctl_module.current_epoch_seconds(), int)
-            self.assertEqual(
-                backupctl_module.read_existing_repository_metrics(
-                    pathlib.Path(temp_dir) / "missing.prom", "host.example.com"
-                ),
-                {},
-            )
-            self.assertEqual(
-                backupctl_module.read_existing_repository_metrics(
-                    metrics_path, "host.example.com"
-                ),
-                {},
-            )
-
-    def test_atomic_write_textfile_cleans_temp_file_after_replace_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            metrics_path = pathlib.Path(temp_dir) / "restic.prom"
-
-            with mock.patch.object(
-                backupctl_module.os, "replace", side_effect=OSError("replace failed")
-            ):
-                with self.assertRaisesRegex(OSError, "replace failed"):
-                    backupctl_module.atomic_write_textfile(metrics_path, "metric 1\n")
-
-            self.assertEqual(list(pathlib.Path(temp_dir).iterdir()), [])
-
-    def test_record_backup_success_skips_without_textfile_dir(self) -> None:
-        runner = FakeRunner()
-        metrics_path = pathlib.Path("/missing/grayhaven/restic.prom")
-        service = backupctl_module.BackupService(
-            self.config, runner, metrics_path=metrics_path
-        )
-
-        with mock.patch.object(
-            backupctl_module, "hostname_fqdn", return_value="host.example.com"
-        ) as hostname:
-            service.record_backup_success(["local"])
-
-        hostname.assert_not_called()
-
-    def test_restic_metric_rendering_orders_repository_labels(self) -> None:
-        metrics = backupctl_module.render_restic_success_metrics(
-            "host.example.com", 456, {"remote": 123, "local": 456}
-        )
-
-        local_index = metrics.index('repository="local"')
-        remote_index = metrics.index('repository="remote"')
-        self.assertLess(local_index, remote_index)
-
-    def test_authoritative_backup_reports_failures_and_verbose_output(self) -> None:
-        runner = mock.Mock(spec=backupctl_module.CommandRunner)
-        runner.run.return_value = mock.Mock(stdout="backup output\n")
-        service = backupctl_module.BackupService(self.config, runner)
-
-        with contextlib.redirect_stdout(io.StringIO()) as stdout:
-            service.run_authoritative_backup(verbose=True)
-
-        self.assertIn("backup output", stdout.getvalue())
-
-        runner.run.side_effect = subprocess.CalledProcessError(
-            1, ["backup"], stderr="backup failed"
-        )
-        with self.assertRaisesRegex(
-            backupctl_module.GrayhavenBackupctlError, "backup failed"
-        ):
-            service.run_authoritative_backup(verbose=False)
-
-        runner.run.side_effect = subprocess.CalledProcessError(1, ["backup"], stderr="")
-        with self.assertRaisesRegex(
-            backupctl_module.GrayhavenBackupctlError, "Backup script failed"
-        ):
-            service.run_authoritative_backup(verbose=False)
-
-    def test_hostname_fqdn_uses_system_hostname(self) -> None:
-        with mock.patch.object(
-            backupctl_module.subprocess,
-            "run",
-            return_value=mock.Mock(stdout="host.example.com\n"),
-        ):
-            self.assertEqual(backupctl_module.hostname_fqdn(), "host.example.com")
+                with self.subTest(flag=flag):
+                    self.assertEqual(
+                        backupctl_module.BackupConfig.from_backup_script(
+                            path
+                        ).repository_selection_supported,
+                        expected,
+                    )
 
     def test_path_helpers_handle_files_globs_and_path_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

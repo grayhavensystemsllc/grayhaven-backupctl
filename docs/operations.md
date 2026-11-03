@@ -113,6 +113,10 @@ If remote backups are not configured, `backup --repo all` creates the local
 backup and warns that no remote backup was created. `backup --repo remote`
 warns that remote backups are not configured without creating a backup.
 
+All repository selections use the managed backup workflow. When configured, it
+creates and verifies the application database snapshot before backing up the
+selected repositories.
+
 [Back to top](#operations)
 
 ## Listing Backup Contents
