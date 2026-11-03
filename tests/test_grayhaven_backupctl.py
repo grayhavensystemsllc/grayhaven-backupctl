@@ -1537,22 +1537,16 @@ class GrayhavenBackupctlTests(unittest.TestCase):
 
     def test_each_backup_selection_uses_the_same_managed_workflow(self) -> None:
         config = invented_backup_config()
-        for selection in ("local", "remote", "all"):
-            with self.subTest(selection=selection):
-                runner = FakeRunner()
-                service = backupctl_module.BackupService(config, runner)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    service.backup(selection, verbose=False)
-                commands = [
-                    call
-                    for call in runner.calls
-                    if call[0] == str(backupctl_module.BACKUP_SCRIPT)
-                ]
-                self.assertEqual(
-                    commands,
-                    [[str(backupctl_module.BACKUP_SCRIPT), "--repo", selection]],
-                )
-                self.assertFalse(any(call[0] == "restic" for call in runner.calls))
+        script = pathlib.Path("/fixture/backup-runner")
+        with mock.patch.object(backupctl_module, "BACKUP_SCRIPT", script):
+            for selection in ("local", "remote", "all"):
+                with self.subTest(selection=selection):
+                    runner = FakeRunner()
+                    service = backupctl_module.BackupService(config, runner)
+                    service.journal = mock.Mock()
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        service.backup(selection, verbose=False)
+                    self.assertEqual(runner.calls, [[str(script), "--repo", selection]])
 
     def test_unsupported_managed_workflow_fails_before_any_backup(self) -> None:
         runner = FakeRunner()
@@ -1572,24 +1566,19 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         self,
     ) -> None:
         config = dataclass_replace(
-            invented_backup_config(),
-            remote_enabled=False,
-            remote_repository=None,
-            repository_selection_supported=True,
+            invented_backup_config(), remote_enabled=False, remote_repository=None
         )
         runner = FakeRunner()
         service = backupctl_module.BackupService(config, runner)
-        with contextlib.redirect_stdout(io.StringIO()):
+        service.journal = mock.Mock()
+        script = pathlib.Path("/fixture/backup-runner")
+        with (
+            mock.patch.object(backupctl_module, "BACKUP_SCRIPT", script),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
             service.backup("remote", verbose=False)
             service.backup("all", verbose=False)
-        commands = [
-            call
-            for call in runner.calls
-            if call[0] == str(backupctl_module.BACKUP_SCRIPT)
-        ]
-        self.assertEqual(
-            commands, [[str(backupctl_module.BACKUP_SCRIPT), "--repo", "all"]]
-        )
+        self.assertEqual(runner.calls, [[str(script), "--repo", "all"]])
 
     def test_managed_workflow_failure_is_reported_and_verbose_output_is_preserved(
         self,
@@ -1599,18 +1588,21 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         service = backupctl_module.BackupService(config, runner)
         sample_output = "example result\n"
         runner.run.return_value = mock.Mock(stdout=sample_output)
-        with contextlib.redirect_stdout(io.StringIO()) as stdout:
-            service.run_authoritative_backup("local", verbose=True)
-        self.assertEqual(stdout.getvalue(), sample_output)
-        for message in ("example failure", ""):
-            runner.run.side_effect = subprocess.CalledProcessError(
-                1, ["fixture"], stderr=message
-            )
-            with (
-                self.subTest(message=message),
-                self.assertRaises(backupctl_module.GrayhavenBackupctlError),
-            ):
-                service.backup("local", verbose=False)
+        with mock.patch.object(
+            backupctl_module, "BACKUP_SCRIPT", pathlib.Path("/fixture/backup-runner")
+        ):
+            with contextlib.redirect_stdout(io.StringIO()) as stdout:
+                service.run_authoritative_backup("local", verbose=True)
+            self.assertEqual(stdout.getvalue(), sample_output)
+            for message in ("example failure", ""):
+                runner.run.side_effect = subprocess.CalledProcessError(
+                    1, ["fixture"], stderr=message
+                )
+                with (
+                    self.subTest(message=message),
+                    self.assertRaises(backupctl_module.GrayhavenBackupctlError),
+                ):
+                    service.backup("local", verbose=False)
 
     def test_backup_script_capability_is_read_from_synthetic_configuration(
         self,
