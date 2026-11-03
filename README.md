@@ -89,6 +89,8 @@ Create local and remote backups, when remote backups are configured:
 sudo grayhaven-backupctl backup
 ```
 
+Backups first create and verify configured application database snapshots.
+
 Find local or remote backups that contain a path:
 
 ```bash
