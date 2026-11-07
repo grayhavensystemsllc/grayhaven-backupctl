@@ -10,6 +10,7 @@ select = ["B", "E", "F", "I", "PERF", "RUF", "S", "SIM", "UP"]
 
 [tool.coverage.run]
 branch = true
+include = ["grayhaven-backupctl"]
 
 [tool.coverage.report]
 fail_under = 90
