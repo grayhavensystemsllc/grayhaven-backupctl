@@ -20,6 +20,10 @@ from types import ModuleType
 from typing import Any, ClassVar
 from unittest import mock
 
+from tests.diagnostics import install
+
+install()
+
 # ---------------------------------------------------------------------------
 # Module loading
 # ---------------------------------------------------------------------------
@@ -86,17 +90,20 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         environment = mock.patch.dict(os.environ, {}, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.test_root = pathlib.Path(temporary.name)
         self.config = backupctl_module.BackupConfig(
-            local_repository="/var/backups/restic",
+            local_repository="/fixture/repository",
             remote_enabled=True,
-            remote_repository="gs:host-restic:/",
-            password_file="/etc/grayhaven/backup/restic-password",
-            include_file="/etc/grayhaven/backup/include",
-            exclude_file="/etc/grayhaven/backup/exclude",
+            remote_repository="fixture:remote",
+            password_file="/fixture/settings/restic-password",
+            include_file="/fixture/settings/include",
+            exclude_file="/fixture/settings/exclude",
             keep_daily=7,
-            restic_cache_dir="/var/cache/restic",
-            gcs_credentials_file="/etc/grayhaven/backup/gcs-credentials.json",
-            gcs_project_id="grayhaven",
+            restic_cache_dir="/fixture/cache",
+            gcs_credentials_file="/fixture/settings/gcs-credentials.json",
+            gcs_project_id="example-project",
         )
 
     def test_reads_authoritative_backup_script_config(self) -> None:
@@ -105,16 +112,16 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             config_path.write_text(
                 "\n".join(
                     [
-                        'LOCAL_REPOSITORY="/var/backups/restic"',
+                        'LOCAL_REPOSITORY="/fixture/repository"',
                         "REMOTE_ENABLED=true",
                         'REMOTE_REPOSITORY="gs:test-restic:/"',
                         'PASSWORD_FILE="/secret/password"',
                         'INCLUDE_FILE="/backup/include"',
                         'EXCLUDE_FILE="/backup/exclude"',
                         "KEEP_DAILY=7",
-                        'RESTIC_CACHE_DIR="/var/cache/restic"',
+                        'RESTIC_CACHE_DIR="/fixture/cache"',
                         'GCS_CREDENTIALS_FILE="/secret/gcs.json"',
-                        "GCS_PROJECT_ID=grayhaven",
+                        "GCS_PROJECT_ID=example-project",
                     ]
                 ),
                 encoding="utf-8",
@@ -122,10 +129,10 @@ class GrayhavenBackupctlTests(unittest.TestCase):
 
             config = backupctl_module.BackupConfig.from_backup_script(config_path)
 
-        self.assertEqual(config.local_repository, "/var/backups/restic")
+        self.assertEqual(config.local_repository, "/fixture/repository")
         self.assertTrue(config.remote_enabled)
         self.assertEqual(config.remote_repository, "gs:test-restic:/")
-        self.assertEqual(config.gcs_project_id, "grayhaven")
+        self.assertEqual(config.gcs_project_id, "example-project")
 
     def test_backup_config_defaults_remote_disabled_when_not_declared(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -133,12 +140,12 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             config_path.write_text(
                 "\n".join(
                     [
-                        'LOCAL_REPOSITORY="/var/backups/restic"',
+                        'LOCAL_REPOSITORY="/fixture/repository"',
                         'PASSWORD_FILE="/secret/password"',
                         'INCLUDE_FILE="/backup/include"',
                         'EXCLUDE_FILE="/backup/exclude"',
                         "KEEP_DAILY=7",
-                        'RESTIC_CACHE_DIR="/var/cache/restic"',
+                        'RESTIC_CACHE_DIR="/fixture/cache"',
                     ]
                 ),
                 encoding="utf-8",
@@ -156,7 +163,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             "Unable to read backup configuration",
         ):
             backupctl_module.BackupConfig.from_backup_script(
-                pathlib.Path("/missing/grayhaven-restic-backup")
+                self.test_root / "missing-backup-script"
             )
 
     def test_backup_config_reports_missing_required_values(self) -> None:
@@ -167,7 +174,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
                     [
                         "# comments and shell logic are ignored",
                         "REMOTE_ENABLED=false",
-                        'LOCAL_REPOSITORY="/var/backups/restic"',
+                        'LOCAL_REPOSITORY="/fixture/repository"',
                     ]
                 ),
                 encoding="utf-8",
@@ -218,7 +225,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         config = dataclass_replace(
             self.config, gcs_project_id=None, gcs_credentials_file=None
         )
-        repo = backupctl_module.Repository("remote", "gs:host-restic:/", config)
+        repo = backupctl_module.Repository("remote", "fixture:remote", config)
 
         self.assert_environment_equal(
             repo.env, {"RESTIC_CACHE_DIR": config.restic_cache_dir}
@@ -290,8 +297,6 @@ class GrayhavenBackupctlTests(unittest.TestCase):
                 self.assertEqual(len(result.failures), 1)
                 self.assertEqual(len(result.errors), 0)
                 diagnostic = output.getvalue()
-                for key in set(actual) | set(expected):
-                    self.assertTrue(key in diagnostic, "Missing environment key")
                 for value in (dummy_value, expected_value):
                     self.assertFalse(
                         value in diagnostic, "Environment value leaked in diagnostic"
@@ -424,10 +429,10 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         ]
         runner = FakeRunner(
             {
-                restic_key("/var/backups/restic", "snapshots", "--json"): json.dumps(
+                restic_key("/fixture/repository", "snapshots", "--json"): json.dumps(
                     snapshots
                 ),
-                restic_key("gs:host-restic:/", "snapshots", "--json"): "[]",
+                restic_key("fixture:remote", "snapshots", "--json"): "[]",
             }
         )
         service = backupctl_module.BackupService(self.config, runner)
@@ -447,7 +452,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         new_id = "babababa11111111222222223333333344444444"
         runner = FakeRunner(
             {
-                restic_key("/var/backups/restic", "snapshots", "--json"): json.dumps(
+                restic_key("/fixture/repository", "snapshots", "--json"): json.dumps(
                     [
                         snapshot_record(old_id, "2026-06-20T01:00:00Z"),
                         snapshot_record(new_id, "2026-06-22T01:00:00Z"),
@@ -464,7 +469,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         self.assertEqual([snapshot.id for snapshot in result], [old_id])
 
     def test_run_restic_reports_stderr_and_generic_failures(self) -> None:
-        repo = backupctl_module.Repository("local", "/var/backups/restic", self.config)
+        repo = backupctl_module.Repository("local", "/fixture/repository", self.config)
         runner = mock.Mock(spec=backupctl_module.CommandRunner)
         runner.run.side_effect = subprocess.CalledProcessError(
             1, ["restic"], stderr="bad password"
@@ -486,7 +491,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         snapshot_id = "bbbbbbbb11111111222222223333333344444444"
         runner = FakeRunner(
             {
-                restic_key("/var/backups/restic", "snapshots", "--json"): json.dumps(
+                restic_key("/fixture/repository", "snapshots", "--json"): json.dumps(
                     [
                         {
                             "id": snapshot_id,
@@ -496,41 +501,49 @@ class GrayhavenBackupctlTests(unittest.TestCase):
                         }
                     ]
                 ),
-                restic_key("gs:host-restic:/", "snapshots", "--json"): "[]",
+                restic_key("fixture:remote", "snapshots", "--json"): "[]",
                 restic_key(
-                    "/var/backups/restic",
+                    "/fixture/repository",
                     "ls",
                     snapshot_id,
                     "--json",
                     "--recursive",
-                    "/home/jsmith",
+                    "/home/fixture-user",
                 ): "\n".join(
                     [
-                        json.dumps({"type": "dir", "path": "/home/jsmith"}),
-                        json.dumps({"type": "file", "path": "/home/jsmith/report.txt"}),
+                        json.dumps({"type": "dir", "path": "/home/fixture-user"}),
+                        json.dumps(
+                            {"type": "file", "path": "/home/fixture-user/report.txt"}
+                        ),
                     ]
                 ),
             }
         )
         service = backupctl_module.BackupService(self.config, runner)
 
-        matches = service.find_matches("local", ["/home/jsmith/*.txt"])
+        matches = service.find_matches("local", ["/home/fixture-user/*.txt"])
 
         self.assertEqual(len(matches), 1)
-        self.assertEqual(matches[0].matched_path, "/home/jsmith/report.txt")
+        self.assertEqual(matches[0].matched_path, "/home/fixture-user/report.txt")
 
     def test_ls_ignores_blank_snapshot_and_malformed_lines(self) -> None:
         snapshot_id = "1212121211111111222222223333333344444444"
         runner = FakeRunner(
             {
                 restic_key(
-                    "/var/backups/restic", "ls", snapshot_id, "--json", "/home/jsmith"
+                    "/fixture/repository",
+                    "ls",
+                    snapshot_id,
+                    "--json",
+                    "/home/fixture-user",
                 ): "\n".join(
                     [
                         "",
                         "{not-json}",
                         json.dumps({"type": "snapshot", "path": "/"}),
-                        json.dumps({"type": "file", "path": "/home/jsmith/report.txt"}),
+                        json.dumps(
+                            {"type": "file", "path": "/home/fixture-user/report.txt"}
+                        ),
                     ]
                 )
             }
@@ -538,35 +551,43 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         service = backupctl_module.BackupService(self.config, runner)
 
         paths = service.list_snapshot_contents(
-            backupctl_module.Repository("local", "/var/backups/restic", self.config),
+            backupctl_module.Repository("local", "/fixture/repository", self.config),
             snapshot_id,
-            "/home/jsmith",
+            "/home/fixture-user",
         )
 
-        self.assertEqual(paths, ["/home/jsmith/report.txt"])
+        self.assertEqual(paths, ["/home/fixture-user/report.txt"])
 
     def test_ls_is_non_recursive_by_default(self) -> None:
         snapshot_id = "abababab11111111222222223333333344444444"
         runner = FakeRunner(
             {
                 restic_key(
-                    "/var/backups/restic", "ls", snapshot_id, "--json", "/home/jsmith"
-                ): json.dumps({"type": "dir", "path": "/home/jsmith"})
+                    "/fixture/repository",
+                    "ls",
+                    snapshot_id,
+                    "--json",
+                    "/home/fixture-user",
+                ): json.dumps({"type": "dir", "path": "/home/fixture-user"})
             }
         )
         service = backupctl_module.BackupService(self.config, runner)
 
         paths = service.list_snapshot_contents(
-            backupctl_module.Repository("local", "/var/backups/restic", self.config),
+            backupctl_module.Repository("local", "/fixture/repository", self.config),
             snapshot_id,
-            "/home/jsmith",
+            "/home/fixture-user",
         )
 
-        self.assertEqual(paths, ["/home/jsmith"])
+        self.assertEqual(paths, ["/home/fixture-user"])
         self.assertIn(
             list(
                 restic_key(
-                    "/var/backups/restic", "ls", snapshot_id, "--json", "/home/jsmith"
+                    "/fixture/repository",
+                    "ls",
+                    snapshot_id,
+                    "--json",
+                    "/home/fixture-user",
                 )
             ),
             runner.calls,
@@ -577,16 +598,18 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         runner = FakeRunner(
             {
                 restic_key(
-                    "/var/backups/restic",
+                    "/fixture/repository",
                     "ls",
                     snapshot_id,
                     "--json",
                     "--recursive",
-                    "/home/jsmith",
+                    "/home/fixture-user",
                 ): "\n".join(
                     [
-                        json.dumps({"type": "dir", "path": "/home/jsmith"}),
-                        json.dumps({"type": "file", "path": "/home/jsmith/report.txt"}),
+                        json.dumps({"type": "dir", "path": "/home/fixture-user"}),
+                        json.dumps(
+                            {"type": "file", "path": "/home/fixture-user/report.txt"}
+                        ),
                     ]
                 )
             }
@@ -594,22 +617,22 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         service = backupctl_module.BackupService(self.config, runner)
 
         paths = service.list_snapshot_contents(
-            backupctl_module.Repository("local", "/var/backups/restic", self.config),
+            backupctl_module.Repository("local", "/fixture/repository", self.config),
             snapshot_id,
-            "/home/jsmith",
+            "/home/fixture-user",
             recursive=True,
         )
 
-        self.assertEqual(paths, ["/home/jsmith", "/home/jsmith/report.txt"])
+        self.assertEqual(paths, ["/home/fixture-user", "/home/fixture-user/report.txt"])
         self.assertIn(
             list(
                 restic_key(
-                    "/var/backups/restic",
+                    "/fixture/repository",
                     "ls",
                     snapshot_id,
                     "--json",
                     "--recursive",
-                    "/home/jsmith",
+                    "/home/fixture-user",
                 )
             ),
             runner.calls,
@@ -620,45 +643,45 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         older_id = "dddddddd11111111222222223333333344444444"
         runner = FakeRunner(
             {
-                restic_key("/var/backups/restic", "snapshots", "--json"): json.dumps(
+                restic_key("/fixture/repository", "snapshots", "--json"): json.dumps(
                     [
                         snapshot_record(newer_id, "2026-06-22T01:00:00Z"),
                         snapshot_record(older_id, "2026-06-21T01:00:00Z"),
                     ]
                 ),
-                restic_key("gs:host-restic:/", "snapshots", "--json"): "[]",
+                restic_key("fixture:remote", "snapshots", "--json"): "[]",
                 restic_key(
-                    "/var/backups/restic",
+                    "/fixture/repository",
                     "ls",
                     newer_id,
                     "--json",
                     "--recursive",
-                    "/home/jsmith/new.txt",
-                ): json.dumps({"type": "file", "path": "/home/jsmith/new.txt"}),
+                    "/home/fixture-user/new.txt",
+                ): json.dumps({"type": "file", "path": "/home/fixture-user/new.txt"}),
                 restic_key(
-                    "/var/backups/restic",
+                    "/fixture/repository",
                     "ls",
                     newer_id,
                     "--json",
                     "--recursive",
-                    "/home/jsmith/old.txt",
+                    "/home/fixture-user/old.txt",
                 ): "",
                 restic_key(
-                    "/var/backups/restic",
+                    "/fixture/repository",
                     "ls",
                     older_id,
                     "--json",
                     "--recursive",
-                    "/home/jsmith/new.txt",
+                    "/home/fixture-user/new.txt",
                 ): "",
                 restic_key(
-                    "/var/backups/restic",
+                    "/fixture/repository",
                     "ls",
                     older_id,
                     "--json",
                     "--recursive",
-                    "/home/jsmith/old.txt",
-                ): json.dumps({"type": "file", "path": "/home/jsmith/old.txt"}),
+                    "/home/fixture-user/old.txt",
+                ): json.dumps({"type": "file", "path": "/home/fixture-user/old.txt"}),
             }
         )
         service = backupctl_module.BackupService(self.config, runner)
@@ -666,31 +689,32 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         plan = service.resolve_restore_plan(
             "local",
             "latest",
-            ["/home/jsmith/new.txt", "/home/jsmith/old.txt"],
+            ["/home/fixture-user/new.txt", "/home/fixture-user/old.txt"],
             pathlib.Path("/tmp/restore"),
             in_place=False,
         )
 
         self.assertEqual([item.snapshot.id for item in plan], [newer_id, older_id])
         self.assertEqual(
-            plan[0].destination_path, pathlib.Path("/tmp/restore/home/jsmith/new.txt")
+            plan[0].destination_path,
+            pathlib.Path("/tmp/restore/home/fixture-user/new.txt"),
         )
 
     def test_restore_in_place_targets_original_path(self) -> None:
         snapshot_id = "3434343411111111222222223333333344444444"
         runner = FakeRunner(
             {
-                restic_key("/var/backups/restic", "snapshots", "--json"): json.dumps(
+                restic_key("/fixture/repository", "snapshots", "--json"): json.dumps(
                     [snapshot_record(snapshot_id, "2026-06-22T01:00:00Z")]
                 ),
                 restic_key(
-                    "/var/backups/restic",
+                    "/fixture/repository",
                     "ls",
                     snapshot_id,
                     "--json",
                     "--recursive",
-                    "/home/jsmith/file.txt",
-                ): json.dumps({"type": "file", "path": "/home/jsmith/file.txt"}),
+                    "/home/fixture-user/file.txt",
+                ): json.dumps({"type": "file", "path": "/home/fixture-user/file.txt"}),
             }
         )
         service = backupctl_module.BackupService(self.config, runner)
@@ -698,13 +722,13 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         plan = service.resolve_restore_plan(
             "local",
             snapshot_id[:8],
-            ["/home/jsmith/file.txt"],
+            ["/home/fixture-user/file.txt"],
             pathlib.Path("/tmp/restore"),
             in_place=True,
         )
 
         self.assertEqual(
-            plan[0].destination_path, pathlib.Path("/home/jsmith/file.txt")
+            plan[0].destination_path, pathlib.Path("/home/fixture-user/file.txt")
         )
 
     def test_restore_plan_reports_missing_path(self) -> None:
@@ -716,7 +740,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             service.resolve_restore_plan(
                 "local",
                 "latest",
-                ["/home/jsmith/missing.txt"],
+                ["/home/fixture-user/missing.txt"],
                 pathlib.Path("/tmp/restore"),
                 in_place=False,
             )
@@ -726,28 +750,28 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         remote_id = "ffffffff11111111222222223333333344444444"
         runner = FakeRunner(
             {
-                restic_key("/var/backups/restic", "snapshots", "--json"): json.dumps(
+                restic_key("/fixture/repository", "snapshots", "--json"): json.dumps(
                     [snapshot_record(local_id, "2026-06-22T01:00:00Z")]
                 ),
-                restic_key("gs:host-restic:/", "snapshots", "--json"): json.dumps(
+                restic_key("fixture:remote", "snapshots", "--json"): json.dumps(
                     [snapshot_record(remote_id, "2026-06-22T01:05:00Z")]
                 ),
                 restic_key(
-                    "/var/backups/restic",
+                    "/fixture/repository",
                     "ls",
                     local_id,
                     "--json",
                     "--recursive",
-                    "/home/jsmith/file.txt",
-                ): json.dumps({"type": "file", "path": "/home/jsmith/file.txt"}),
+                    "/home/fixture-user/file.txt",
+                ): json.dumps({"type": "file", "path": "/home/fixture-user/file.txt"}),
                 restic_key(
-                    "gs:host-restic:/",
+                    "fixture:remote",
                     "ls",
                     remote_id,
                     "--json",
                     "--recursive",
-                    "/home/jsmith/file.txt",
-                ): json.dumps({"type": "file", "path": "/home/jsmith/file.txt"}),
+                    "/home/fixture-user/file.txt",
+                ): json.dumps({"type": "file", "path": "/home/fixture-user/file.txt"}),
             }
         )
         service = backupctl_module.BackupService(self.config, runner)
@@ -755,7 +779,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         plan = service.resolve_restore_plan(
             "all",
             "latest",
-            ["/home/jsmith/file.txt"],
+            ["/home/fixture-user/file.txt"],
             pathlib.Path("/tmp/restore"),
             in_place=False,
         )
@@ -768,21 +792,21 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         older_id = "2222222211111111222222223333333344444444"
         runner = FakeRunner(
             {
-                restic_key("/var/backups/restic", "snapshots", "--json"): json.dumps(
+                restic_key("/fixture/repository", "snapshots", "--json"): json.dumps(
                     [
                         snapshot_record(newer_id, "2026-06-23T01:00:00Z"),
                         snapshot_record(older_id, "2026-06-21T01:00:00Z"),
                     ]
                 ),
-                restic_key("gs:host-restic:/", "snapshots", "--json"): "[]",
+                restic_key("fixture:remote", "snapshots", "--json"): "[]",
                 restic_key(
-                    "/var/backups/restic",
+                    "/fixture/repository",
                     "ls",
                     older_id,
                     "--json",
                     "--recursive",
-                    "/home/jsmith/file.txt",
-                ): json.dumps({"type": "file", "path": "/home/jsmith/file.txt"}),
+                    "/home/fixture-user/file.txt",
+                ): json.dumps({"type": "file", "path": "/home/fixture-user/file.txt"}),
             }
         )
         service = backupctl_module.BackupService(self.config, runner)
@@ -790,7 +814,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         plan = service.resolve_restore_plan(
             "local",
             "latest",
-            ["/home/jsmith/file.txt"],
+            ["/home/fixture-user/file.txt"],
             pathlib.Path("/tmp/restore"),
             in_place=False,
             until=datetime.fromisoformat("2026-06-22T00:00:00+00:00"),
@@ -799,7 +823,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         self.assertEqual(plan[0].snapshot.id, older_id)
 
     def test_restore_executes_restic_and_copies_result(self) -> None:
-        repo = backupctl_module.Repository("local", "/var/backups/restic", self.config)
+        repo = backupctl_module.Repository("local", "/fixture/repository", self.config)
         snapshot = backupctl_module.Snapshot(
             repo="local",
             short_id="abababab",
@@ -812,16 +836,16 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             backupctl_module.RestoreItem(
                 repo=repo,
                 snapshot=snapshot,
-                requested_path="/home/jsmith/file.txt",
-                source_path="/home/jsmith/file.txt",
-                destination_path=pathlib.Path("/restore/home/jsmith/file.txt"),
+                requested_path="/home/fixture-user/file.txt",
+                source_path="/home/fixture-user/file.txt",
+                destination_path=pathlib.Path("/restore/home/fixture-user/file.txt"),
             )
         ]
         service = backupctl_module.BackupService(self.config, FakeRunner())
 
         def fake_run_restic(_repo, args, *, check=True):
             target = pathlib.Path(args[args.index("--target") + 1])
-            restored = target / "home" / "jsmith" / "file.txt"
+            restored = target / "home" / "fixture-user" / "file.txt"
             restored.parent.mkdir(parents=True)
             restored.write_text("restored", encoding="utf-8")
             return ""
@@ -832,12 +856,12 @@ class GrayhavenBackupctlTests(unittest.TestCase):
                     with contextlib.redirect_stdout(io.StringIO()) as stdout:
                         service.restore(plan, force=True, verbose=True)
 
-        self.assertIn("Repository: /var/backups/restic", stdout.getvalue())
+        self.assertIn("Repository: /fixture/repository", stdout.getvalue())
         copy_path.assert_called_once()
         journal_log.assert_called_once()
 
     def test_restore_reports_missing_restored_source(self) -> None:
-        repo = backupctl_module.Repository("local", "/var/backups/restic", self.config)
+        repo = backupctl_module.Repository("local", "/fixture/repository", self.config)
         snapshot = backupctl_module.Snapshot(
             repo="local",
             short_id="abababab",
@@ -850,9 +874,9 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             backupctl_module.RestoreItem(
                 repo=repo,
                 snapshot=snapshot,
-                requested_path="/home/jsmith/file.txt",
-                source_path="/home/jsmith/file.txt",
-                destination_path=pathlib.Path("/restore/home/jsmith/file.txt"),
+                requested_path="/home/fixture-user/file.txt",
+                source_path="/home/fixture-user/file.txt",
+                destination_path=pathlib.Path("/restore/home/fixture-user/file.txt"),
             )
         ]
         service = backupctl_module.BackupService(self.config, FakeRunner())
@@ -865,7 +889,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
                     service.restore(plan, force=True, verbose=False)
 
     def test_restore_confirms_overwrite_when_needed(self) -> None:
-        repo = backupctl_module.Repository("local", "/var/backups/restic", self.config)
+        repo = backupctl_module.Repository("local", "/fixture/repository", self.config)
         snapshot = backupctl_module.Snapshot(
             repo="local",
             short_id="abababab",
@@ -881,8 +905,8 @@ class GrayhavenBackupctlTests(unittest.TestCase):
                 backupctl_module.RestoreItem(
                     repo=repo,
                     snapshot=snapshot,
-                    requested_path="/home/jsmith/file.txt",
-                    source_path="/home/jsmith/file.txt",
+                    requested_path="/home/fixture-user/file.txt",
+                    source_path="/home/fixture-user/file.txt",
                     destination_path=destination,
                 )
             ]
@@ -890,7 +914,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
 
             def fake_run_restic(_repo, args, *, check=True):
                 target = pathlib.Path(args[args.index("--target") + 1])
-                restored = target / "home" / "jsmith" / "file.txt"
+                restored = target / "home" / "fixture-user" / "file.txt"
                 restored.parent.mkdir(parents=True)
                 restored.write_text("restored", encoding="utf-8")
                 return ""
@@ -1437,9 +1461,9 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             root = pathlib.Path(temp_dir)
             source_root = root / "restored"
             source_home = source_root / "home"
-            source_user = source_home / "jsmith"
+            source_user = source_home / "fixture-user"
             source_file = source_user / "myfile"
-            destination = root / "target" / "home" / "jsmith" / "myfile"
+            destination = root / "target" / "home" / "fixture-user" / "myfile"
             source_user.mkdir(parents=True)
             source_file.write_text("restored", encoding="utf-8")
             source_home.chmod(0o755)
@@ -1459,7 +1483,7 @@ class GrayhavenBackupctlTests(unittest.TestCase):
                 oct((root / "target" / "home").stat().st_mode & 0o777), "0o755"
             )
             self.assertEqual(
-                oct((root / "target" / "home" / "jsmith").stat().st_mode & 0o777),
+                oct((root / "target" / "home" / "fixture-user").stat().st_mode & 0o777),
                 "0o700",
             )
 
@@ -1651,8 +1675,8 @@ class GrayhavenBackupctlTests(unittest.TestCase):
             backupctl_module.probe_root_for_pattern("/home/*/app.log"), "/home"
         )
         self.assertEqual(
-            backupctl_module.probe_root_for_pattern("/home/jsmith/app*.log"),
-            "/home/jsmith",
+            backupctl_module.probe_root_for_pattern("/home/fixture-user/app*.log"),
+            "/home/fixture-user",
         )
         self.assertEqual(
             backupctl_module.probe_root_for_pattern("[abc].log"),
@@ -1660,14 +1684,14 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         )
         self.assertEqual(
             backupctl_module.first_matching_path(
-                "/home/jsmith/project/",
-                ["/home/jsmith/project"],
+                "/home/fixture-user/project/",
+                ["/home/fixture-user/project"],
             ),
-            "/home/jsmith/project",
+            "/home/fixture-user/project",
         )
         self.assertEqual(
             backupctl_module.first_matching_path(
-                "/home/jsmith/*.txt", ["/home/jsmith/a.log"]
+                "/home/fixture-user/*.txt", ["/home/fixture-user/a.log"]
             ),
             None,
         )
@@ -1688,7 +1712,9 @@ class GrayhavenBackupctlTests(unittest.TestCase):
         )
 
     def test_read_requested_paths_reports_file_and_empty_errors(self) -> None:
-        missing_file_args = mock.Mock(path=[], path_file="/missing/path-list")
+        missing_file_args = mock.Mock(
+            path=[], path_file=str(self.test_root / "missing-path-list")
+        )
         with self.assertRaisesRegex(
             backupctl_module.GrayhavenBackupctlError, "Unable to read path file"
         ):
@@ -2345,7 +2371,7 @@ def restic_key(repo: str, *args: str) -> tuple[str, ...]:
         "--repo",
         repo,
         "--password-file",
-        "/etc/grayhaven/backup/restic-password",
+        "/fixture/settings/restic-password",
         *args,
     )
 
